@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -157,6 +158,16 @@ func (s *composeService) watch(ctx context.Context, syncChannel chan bool, proje
 			if checkIfPathAlreadyBindMounted(trigger.Path, service.Volumes) {
 				logrus.Warnf("path '%s' also declared by a bind mount volume, this path won't be monitored!\n", trigger.Path)
 				continue
+			} else {
+				var initialSync bool
+				success, err := trigger.Extensions.Get("x-initialSync", &initialSync)
+				if err == nil && success && initialSync && (trigger.Action == types.WatchActionSync || trigger.Action == types.WatchActionSyncRestart) {
+					// Need to check initial files are in container that are meant to be synched from watch action
+					err := s.initialSync(ctx, project, service, trigger, ignore, syncer)
+					if err != nil {
+						return err
+					}
+				}
 			}
 			paths = append(paths, trigger.Path)
 			pathLogs = append(pathLogs, fmt.Sprintf("Action %s for path %q", trigger.Action, trigger.Path))
@@ -573,4 +584,124 @@ func (s *composeService) pruneDanglingImagesOnRebuild(ctx context.Context, proje
 			}
 		}
 	}
+}
+
+// Walks develop.watch.path and checks which files should be copied inside the container
+// ignores develop.watch.ignore, Dockerfile, compose files, bind mounted paths and .git
+func (s *composeService) initialSync(ctx context.Context, project *types.Project, service types.ServiceConfig, trigger types.Trigger, ignore watch.PathMatcher, syncer sync.Syncer) error {
+	dockerFileIgnore, err := watch.NewDockerPatternMatcher("/", []string{"Dockerfile", "*compose*.y*ml"})
+	if err != nil {
+		return err
+	}
+	triggerIgnore, err := watch.NewDockerPatternMatcher("/", trigger.Ignore)
+	if err != nil {
+		return err
+	}
+	ignoreInitialSync := watch.NewCompositeMatcher(ignore, dockerFileIgnore, triggerIgnore)
+
+	pathsToCopy, err := s.initialSyncFiles(ctx, project, service, trigger, ignoreInitialSync)
+	if err != nil {
+		return err
+	}
+
+	return syncer.Sync(ctx, service, pathsToCopy)
+}
+
+// Syncs files from develop.watch.path if thy have been modified after the image has been created
+//
+//nolint:gocyclo
+func (s *composeService) initialSyncFiles(ctx context.Context, project *types.Project, service types.ServiceConfig, trigger types.Trigger, ignore watch.PathMatcher) ([]sync.PathMapping, error) {
+	fi, err := os.Stat(trigger.Path)
+	if err != nil {
+		return nil, err
+	}
+	timeImageCreated, err := s.imageCreatedTime(ctx, project, service.Name)
+	if err != nil {
+		return nil, err
+	}
+	var pathsToCopy []sync.PathMapping
+	switch mode := fi.Mode(); {
+	case mode.IsDir():
+		// process directory
+		err = filepath.WalkDir(trigger.Path, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				// handle possible path err, just in case...
+				return err
+			}
+			if trigger.Path == path {
+				// walk starts at the root directory
+				return nil
+			}
+			if shouldIgnore(filepath.Base(path), ignore) || checkIfPathAlreadyBindMounted(path, service.Volumes) {
+				// By definition sync ignores bind mounted paths
+				if d.IsDir() {
+					// skip folder
+					return fs.SkipDir
+				}
+				return nil // skip file
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() {
+				if info.ModTime().Before(timeImageCreated) {
+					// skip file if it was modified before image creation
+					return nil
+				}
+				rel, err := filepath.Rel(trigger.Path, path)
+				if err != nil {
+					return err
+				}
+				// only copy files (and not full directories)
+				pathsToCopy = append(pathsToCopy, sync.PathMapping{
+					HostPath:      path,
+					ContainerPath: filepath.Join(trigger.Target, rel),
+				})
+			}
+			return nil
+		})
+	case mode.IsRegular():
+		// process file
+		if fi.ModTime().After(timeImageCreated) && !shouldIgnore(filepath.Base(trigger.Path), ignore) && !checkIfPathAlreadyBindMounted(trigger.Path, service.Volumes) {
+			pathsToCopy = append(pathsToCopy, sync.PathMapping{
+				HostPath:      trigger.Path,
+				ContainerPath: trigger.Target,
+			})
+		}
+	}
+	return pathsToCopy, err
+}
+
+func shouldIgnore(name string, ignore watch.PathMatcher) bool {
+	shouldIgnore, _ := ignore.Matches(name)
+	// ignore files that match any ignore pattern
+	return shouldIgnore
+}
+
+// gets the image creation time for a service
+func (s *composeService) imageCreatedTime(ctx context.Context, project *types.Project, serviceName string) (time.Time, error) {
+	containers, err := s.apiClient().ContainerList(ctx, container.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("label", fmt.Sprintf("%s=%s", api.ProjectLabel, project.Name)),
+			filters.Arg("label", fmt.Sprintf("%s=%s", api.ServiceLabel, serviceName))),
+	})
+	if err != nil {
+		return time.Now(), err
+	}
+	if len(containers) == 0 {
+		return time.Now(), fmt.Errorf("Could not get created time for service's image")
+	}
+
+	img, _, err := s.apiClient().ImageInspectWithRaw(ctx, containers[0].ImageID)
+	if err != nil {
+		return time.Now(), err
+	}
+	// Need to get oldest one?
+	timeCreated, err := time.Parse(time.RFC3339Nano, img.Created)
+	if err != nil {
+		return time.Now(), err
+	}
+	return timeCreated, nil
 }
